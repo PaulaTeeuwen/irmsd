@@ -2,10 +2,11 @@
 README.md and the main README's "Equal-Mass Axis Fallback" section).
 
 Fe4Cage.xyz is a T-symmetric Fe4 cage consisting of 4 heavy metal centers and organic linkers connected in a tetrahedron framework.
-The file pointgroup_isomers.json holds 200 atom permutations, each a point-group operation (simple rotation) of this structure.
+The file pointgroup_isomers.json holds the 11 distinct, non-identity point-group operations (simple rotations) of this structure --
+the full T point group has order 12, so 11 non-identity elements, and every one is included exactly once.
 Each of these isomers must score 0.00 A against the original, unpermuted structure.
-Before the equal-mass fallback, get_irmsd scored only 170/200 of these correctly (worst case ~2 A).
-With this new change, all 200/200 are correctly identified as identical (worst case ~2e-7 A).
+Before the equal-mass fallback, get_irmsd scored only 10/11 of these correctly (worst case ~2 A).
+With this new change, all 11/11 are correctly identified as identical (worst case ~2e-7 A).
 """
 
 import json
