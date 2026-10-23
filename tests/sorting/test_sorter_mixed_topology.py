@@ -16,7 +16,7 @@ import sys
 import numpy as np
 import pytest
 
-from irmsd.api.sorter_exposed import sorter_irmsd
+from irmsd.api.sorter_exposed import openmp_info, sorter_irmsd
 
 ISOPROPANOL_Z = [6, 6, 6, 8, 1, 1, 1, 1, 1, 1, 1, 1]
 ISOPROPANOL_XYZ = [
@@ -104,6 +104,7 @@ THREAD_SCRIPT = """
 import json, sys
 import numpy as np
 sys.path.insert(0, {testdir!r})
+from irmsd import openmp_info
 from test_sorter_mixed_topology import (ISOPROPANOL_XYZ, ISOPROPANOL_Z, PROPANOL_XYZ,
                                         PROPANOL_Z, copies, sort_groups)
 rng = np.random.default_rng(7)
@@ -112,13 +113,14 @@ for k in range(12):
     sigma = 0.01 if k % 3 else 0.3
     ens += copies(PROPANOL_Z, PROPANOL_XYZ, 2, rng, sigma)
     ens += copies(ISOPROPANOL_Z, ISOPROPANOL_XYZ, 1, rng, sigma)
-print(json.dumps(sort_groups(ens)))
+print(json.dumps({{"threads": openmp_info()["max_threads"], "groups": sort_groups(ens)}}))
 """
 
 
+@pytest.mark.skipif(not openmp_info()["enabled"], reason="library built without OpenMP")
 def test_thread_count_does_not_change_grouping():
     """Each pair is compared independently, so the grouping must not depend on
-    the number of OpenMP threads (a build without OpenMP passes trivially)."""
+    the number of OpenMP threads."""
     script = THREAD_SCRIPT.format(testdir=os.path.dirname(os.path.abspath(__file__)))
     results = []
     for threads in ("1", "3"):
@@ -126,6 +128,8 @@ def test_thread_count_does_not_change_grouping():
         out = subprocess.run(
             [sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True
         )
-        results.append(json.loads(out.stdout.strip().splitlines()[-1]))
+        res = json.loads(out.stdout.strip().splitlines()[-1])
+        assert res["threads"] == int(threads)  # the setting reached the library
+        results.append(res["groups"])
     assert results[0] == results[1]
     assert len(set(results[0])) > 1  # the ensemble really has several groups

@@ -16,6 +16,7 @@ module sorter_exposed
   public :: sorter_exposed_xyz_fortran
   public :: delta_irmsd_list_fortran
   public :: cregen_exposed_fortran
+  public :: get_openmp_info_fortran
 
 !================================================================================!
 contains  !> MODULE PROCEDURES START HERE
@@ -1087,6 +1088,27 @@ contains  !> MODULE PROCEDURES START HERE
     structures = structures(ix)
     deallocate (energies,ix)
   end subroutine structures_esort
+
+!=============================================================================!
+
+  subroutine get_openmp_info_fortran(enabled,max_threads) &
+    &        bind(C,name="get_openmp_info_fortran")
+    !**********************************************************
+    !* Report whether the library was built with OpenMP, and
+    !* how many threads a parallel region would use now
+    !* (OMP_NUM_THREADS, else all available cores).
+    !*
+    !* enabled     : (out) 1 if built with OpenMP, else 0
+    !* max_threads : (out) threads per parallel region; 1
+    !*               without OpenMP
+    !**********************************************************
+    implicit none
+    integer(c_int),intent(out) :: enabled,max_threads
+    enabled = 0
+    max_threads = 1
+    !$ enabled = 1
+    !$ max_threads = int(omp_get_max_threads(),c_int)
+  end subroutine get_openmp_info_fortran
 
 !=============================================================================!
 !#############################################################################!

@@ -147,3 +147,18 @@ def cregen_fortran_raw(
     """Low-level wrapper for C symbol 'cregen_exposed_fortran'."""
     f = _get_cregen_exposed_fortran()
     f(nat, nall, xyzall, atall, groups, rthr, ethr, bthr, printlvl, energies)
+
+
+def get_openmp_info_fortran_raw() -> tuple[int, int]:
+    """Low-level wrapper for C symbol 'get_openmp_info_fortran'.
+
+    Returns (enabled, max_threads): enabled is 1 if the library was built
+    with OpenMP, max_threads the number of threads a parallel region uses.
+    """
+    f = LIB.get_openmp_info_fortran
+    f.argtypes = [ct.POINTER(ct.c_int), ct.POINTER(ct.c_int)]
+    f.restype = None
+    enabled = ct.c_int(0)
+    max_threads = ct.c_int(1)
+    f(ct.byref(enabled), ct.byref(max_threads))
+    return int(enabled.value), int(max_threads.value)

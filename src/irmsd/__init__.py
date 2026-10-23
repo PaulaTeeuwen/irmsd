@@ -8,7 +8,7 @@ from .api.canonical_exposed import get_canonical_fortran
 from .api.cn_exposed import get_cn_fortran
 from .api.irmsd_exposed import check_bond_preservation, get_irmsd
 from .api.rmsd_exposed import get_quaternion_rmsd_fortran
-from .api.sorter_exposed import delta_irmsd_list, sorter_irmsd
+from .api.sorter_exposed import delta_irmsd_list, openmp_info, sorter_irmsd
 from .api.symmetry_exposed import (
     SymmetryOperation,
     get_point_group,
@@ -102,6 +102,7 @@ __all__ = [
     "get_irmsd",
     "check_bond_preservation",
     "sorter_irmsd",
+    "openmp_info",
     # molecule utils
     "get_rmsd_molecule",
     "get_irmsd_molecule",
