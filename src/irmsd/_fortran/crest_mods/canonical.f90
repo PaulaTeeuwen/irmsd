@@ -21,7 +21,7 @@ module canonical_mod
   use strucrd
   use adjacency
   use geo
-  use utilities,only:nth_prime
+  use utilities,only:first_primes,sorted_order,isort
   implicit none
   private
 
@@ -35,17 +35,19 @@ module canonical_mod
     integer,allocatable :: hmap(:)  !> map heavy-atom to full atom order
     integer :: maxnei = 0
     integer,allocatable :: neigh(:,:)  !> neighbour list (neigh(j,i) = j-th neighbour of atom i)
-    integer,allocatable :: hadjac(:,:) !> heavy-atom adjacency matrix
+    integer,allocatable :: nhnei(:)    !> number of heavy neighbours of each heavy atom
+    integer,allocatable :: hneigh(:,:) !> heavy neighbours, in heavy-atom indices (never H)
 
     !> the important bit for the algorithm
     integer(int64),allocatable :: invariants(:)
     integer,allocatable :: invariants0(:)
+    logical,allocatable :: ovf(:)      !> prime product overflowed int64
     integer,allocatable :: prime(:)
+    integer,allocatable :: primetab(:) !> the first hatms primes
     integer,allocatable :: rank(:)        !> That's what we are after
 
     !> workspace helpers
     integer,allocatable :: newrank(:)
-    integer(int64),allocatable :: newinv(:)
 
   contains
     procedure :: deallocate => deallocate_canonical_sorter
@@ -62,6 +64,7 @@ module canonical_mod
     procedure :: compare => compare_canonical_sorter
     procedure :: add_h_ranks
     procedure :: split_pair_ranks
+    procedure :: same_graph
   end type canonical_sorter
 
   logical,parameter :: debug = .false.
@@ -87,9 +90,11 @@ contains  !> MODULE PROCEDURES START HERE
     if (allocated(self%invariants0)) deallocate (self%invariants0)
     if (allocated(self%rank)) deallocate (self%rank)
     if (allocated(self%prime)) deallocate (self%prime)
-    if (allocated(self%hadjac)) deallocate (self%hadjac)
+    if (allocated(self%primetab)) deallocate (self%primetab)
+    if (allocated(self%ovf)) deallocate (self%ovf)
+    if (allocated(self%nhnei)) deallocate (self%nhnei)
+    if (allocated(self%hneigh)) deallocate (self%hneigh)
     if (allocated(self%newrank)) deallocate (self%newrank)
-    if (allocated(self%newinv)) deallocate (self%newinv)
     if (allocated(self%neigh)) deallocate (self%neigh)
   end subroutine deallocate_canonical_sorter
 
@@ -105,9 +110,11 @@ contains  !> MODULE PROCEDURES START HERE
     class(canonical_sorter),intent(inout) :: self
     if (allocated(self%invariants)) deallocate (self%invariants)
     if (allocated(self%prime)) deallocate (self%prime)
-    if (allocated(self%hadjac)) deallocate (self%hadjac)
+    if (allocated(self%primetab)) deallocate (self%primetab)
+    if (allocated(self%ovf)) deallocate (self%ovf)
+    if (allocated(self%nhnei)) deallocate (self%nhnei)
+    if (allocated(self%hneigh)) deallocate (self%hneigh)
     if (allocated(self%newrank)) deallocate (self%newrank)
-    if (allocated(self%newinv)) deallocate (self%newinv)
     if (allocated(self%neigh)) deallocate (self%neigh)
   end subroutine shrink_canonical_sorter
 
@@ -129,6 +136,7 @@ contains  !> MODULE PROCEDURES START HERE
     real(wp) :: countbo2
     integer :: i,j,k,ii,ati
     integer,allocatable :: ichrgs(:)
+    logical,allocatable :: hnode(:)
     character(len=:),allocatable :: myinvtype
     logical :: use_icharges,include_H,anyH,nmr_split
 
@@ -168,17 +176,16 @@ contains  !> MODULE PROCEDURES START HERE
     select case (myinvtype)
     case ('apsp+','apsp+nmr') !> custom all-pair-shortest-path algo
 
-      call get_invariant0_apsp(self%hatms,self%hadjac,self%invariants0)
+      allocate (hnode(k))
+      hnode(:) = mol%at(self%hmap(:)) .eq. 1
+      call get_invariant0_apsp(k,self%nhnei,self%hneigh,hnode,self%invariants0)
       do i = 1,k
         ii = self%hmap(i)
         ati = mol%at(ii)
         counth = 0
-        do j = 1,nodes
-          if (Amat(j,ii) .ne. 0) then
-            if (mol%at(j) .eq. 1) then
-              counth = counth+1 !> count H neighbours
-            end if
-          end if
+        do j = 1,self%maxnei
+          if (self%neigh(j,ii) .eq. 0) exit
+          if (mol%at(self%neigh(j,ii)) .eq. 1) counth = counth+1 !> count H neighbours
         end do
         self%invariants0(i) = update_invariant0_apsp(self%invariants0(i),ati,counth)
       end do
@@ -225,7 +232,6 @@ contains  !> MODULE PROCEDURES START HERE
     end if
 !>--- start assignment
     if (.not.allocated(self%newrank)) allocate (self%newrank(k),source=0) !> workspace
-    if (.not.allocated(self%newinv)) allocate (self%newinv(k),source=0_int64) !>workspace
     call self%update_ranks()
     self%rank(:) = self%newrank(:)
     if (debug) then
@@ -242,10 +248,10 @@ contains  !> MODULE PROCEDURES START HERE
       call self%split_pair_ranks(mol)
     end if
 
-!>--- finally, if required, add H atoms
+!>--- finally, if required, add H atoms. H nodes normally hold rank 1 alone,
+!>    so this renumbering is a shift by one; it stays correct if they do not.
     if (include_H.and.anyH) then
-      !> since H's will have been added with rank 1, shift all ranks
-      self%rank(:) = self%rank(:)-1
+      call renumber_heavy_ranks(self,mol)
       call self%add_h_ranks(mol)
     end if
 
@@ -257,7 +263,7 @@ contains  !> MODULE PROCEDURES START HERE
 !*****************************************************************
 !* Builds only the molecular graph part of the canonical_sorter:
 !* the heavy-atom maps (nmap/hmap), the neighbour list (neigh),
-!* the heavy-atom adjacency (hadjac) and the fragment count. The
+!* the heavy-atom neighbour list (hneigh) and the fragment count. The
 !* CANGEN/APSP rank refinement is NOT run here.
 !*
 !* This is the common graph-setup shared by init_canonical_sorter
@@ -278,9 +284,8 @@ contains  !> MODULE PROCEDURES START HERE
     logical,intent(in) :: include_H
     integer,allocatable,intent(out) :: Amat(:,:)
     real(wp),intent(in),optional :: wbo(mol%nat,mol%nat)
-    integer :: nodes,i,j,k,l,maxnei
-    real(wp),allocatable :: cn(:),Bmat(:,:)
-    integer,allocatable :: frag(:)
+    integer :: nodes,i,j,k,l,ii,maxnei
+    integer,allocatable :: nnei(:),frag(:)
 
 !>--- all atoms of the full mol. graph are nodes
     nodes = mol%nat
@@ -298,21 +303,16 @@ contains  !> MODULE PROCEDURES START HERE
     if (.not.allocated(self%invariants0)) allocate (self%invariants0(k),source=0)
     if (.not.allocated(self%prime)) allocate (self%prime(k),source=2)
     if (.not.allocated(self%rank)) allocate (self%rank(k),source=1)
-    if (.not.allocated(self%hadjac)) allocate (self%hadjac(k,k),source=0)
+    if (.not.allocated(self%ovf)) allocate (self%ovf(k),source=.false.)
+    self%primetab = first_primes(k)
 
     if (present(wbo)) then
 !>--- get connectivity. Easiest is just via WBO (allocates Amat)
       call wbo2adjacency(nodes,wbo,Amat,0.02_wp)
     else
-!>--- determine number of subgraphs via CN
-      call mol%cn_to_bond(cn,Bmat,'cov')
-      call wbo2adjacency(nodes,Bmat,Amat,0.02_wp)
-      deallocate (Bmat,cn)
+!>--- connectivity via CN
+      call mol%cn_to_adjacency(Amat)
     end if
-    allocate (frag(nodes),source=0)
-    call setup_fragments(nodes,Amat,frag)
-    self%nfrag = maxval(frag(:),1)
-    deallocate (frag)
 
 !>--- documment neighbour list
     maxnei = 0
@@ -342,13 +342,24 @@ contains  !> MODULE PROCEDURES START HERE
         end if
       end do
     end do
-    !> H's excluded from hadjac, always
+    allocate (nnei(nodes),frag(nodes))
+    nnei(:) = count(self%neigh(:,:) > 0,dim=1)
+    call neighbour_fragments(nodes,nnei,self%neigh,frag,self%nfrag)
+
+!>--- heavy-atom neighbour list; H's are excluded from it, always
+    if (allocated(self%nhnei)) deallocate (self%nhnei)
+    if (allocated(self%hneigh)) deallocate (self%hneigh)
+    allocate (self%nhnei(k),source=0)
+    allocate (self%hneigh(max(maxnei,1),k),source=0)
     do i = 1,k
-      if (mol%at(self%hmap(i)) .eq. 1) cycle
-      do j = 1,i-1
-        if (mol%at(self%hmap(j)) .eq. 1) cycle
-        self%hadjac(j,i) = Amat(self%hmap(j),self%hmap(i))
-        self%hadjac(i,j) = self%hadjac(j,i)
+      ii = self%hmap(i)
+      if (mol%at(ii) .eq. 1) cycle
+      do l = 1,maxnei
+        j = self%neigh(l,ii)
+        if (j .eq. 0) exit
+        if (mol%at(j) .eq. 1) cycle
+        self%nhnei(i) = self%nhnei(i)+1
+        self%hneigh(self%nhnei(i),i) = self%nmap(j)
       end do
     end do
   end subroutine init_canonical_graph
@@ -382,62 +393,176 @@ end subroutine init_canonical_sorter_connect
 
 !========================================================================================!
 
-  subroutine get_invariant0_apsp(hatms,hadjac,inv)
+  subroutine get_invariant0_apsp(n,nnei,neigh,hnode,inv)
+    !*******************************************************************
+    !* Initial APSP invariant. Every atom j gets a distance-weighted sum
+    !* over the graph, built up shell by shell,
+    !*   rinv_d(j) = rinv_{d-1}(j) + sum of rinv_{d-1}(k), d(j,k) = d,
+    !* with atoms of other fragments as the last ("infinitely distant")
+    !* shell. inv(j) is the rank of rinv(j) in descending order.
+    !*
+    !* Distances come from one BFS per atom over the heavy-atom graph.
+    !* H atoms (hnode) are isolated nodes of that graph and only add the
+    !* same constant to every heavy-atom sum, so they are handled in
+    !* closed form: they take rank 1 and the heavy atoms start at rank
+    !* 2, unless a single-atom heavy fragment ties with them at the top.
+    !* The invariants equal those of the former Floyd-Warshall version
+    !* as long as the sums are exact (< 2^53). Beyond that, each shell
+    !* is summed in ascending order of its values, so the result does
+    !* not depend on the atom order and symmetry-equivalent atoms get
+    !* bitwise identical sums. All values are rescaled by a power of
+    !* two (exact) before they can overflow.
+    !*
+    !* n     : number of nodes (heavy-atom indices of canonical_sorter)
+    !* nnei  : number of heavy neighbours of each node
+    !* neigh : heavy neighbours of each node
+    !* hnode : .true. for H atoms carried as (isolated) nodes
+    !* inv   : (out) the invariant
+    !*******************************************************************
     implicit none
-    integer,intent(in)  :: hatms
-    integer,intent(in)  :: hadjac(hatms,hatms)
-    integer,intent(out) :: inv(hatms)
+    integer,intent(in)  :: n
+    integer,intent(in)  :: nnei(n)
+    integer,intent(in)  :: neigh(:,:)
+    logical,intent(in)  :: hnode(n)
+    integer,intent(out) :: inv(n)
 
-    real(wp),allocatable :: dist(:,:)
-    real(wp),allocatable :: rinv(:),tmprinv(:)
-    integer,allocatable  :: tmp(:,:)
-    integer :: i,j,k,maxdist
-    real(wp) :: maxrinv
+    integer,allocatable :: comp(:),csize(:),queue(:),dist(:),ecc(:)
+    integer,allocatable :: list(:),lsize(:),idx(:),cur(:),hidx(:)
+    integer(int64),allocatable :: lpos(:),spos(:)
+    real(wp),allocatable :: rinv(:),tmprinv(:),buf(:),tsum(:)
+    integer :: i,l,c,d,m,ncomp,tail,maxecc,nb,shift
+    integer(int64) :: nlist,nlay
+    real(wp) :: s
+    real(wp),parameter :: bigval = 2.0_wp**900
+
     inv(:) = 1
+    if (n < 1) return
 
-    allocate (tmp(hatms,hatms),source=0)
-    allocate (dist(hatms,hatms),source=0.0_wp)
-
-    !>--- calculate all-pair-shortest-path (APSP)
-    call FloydWarshall(hatms,hadjac,dist,tmp)
-    tmp(:,:) = nint(dist(:,:))
-    maxdist = maxval(tmp)
-    do i = 1,hatms
-      tmp(i,i) = 0
+!>--- fragments of the heavy-atom graph (comp = 0 for H nodes)
+    allocate (comp(n),queue(n),dist(n),ecc(n))
+    call neighbour_fragments(n,nnei,neigh,comp,ncomp,mask=.not.hnode)
+    if (ncomp == 0) return  !> only H nodes
+    allocate (csize(ncomp),source=0)
+    do i = 1,n
+      if (comp(i) > 0) csize(comp(i)) = csize(comp(i))+1
     end do
-    deallocate (dist)
 
-    !>--- get ranks using the APSP
-    allocate (rinv(hatms),tmprinv(hatms),source=1.0_wp)
-    do i = 1,maxdist
-      tmprinv(:) = 0
-      do j = 1,hatms
-        do k = 1,hatms
-          if (tmp(k,j) .eq. i) then
-            tmprinv(j) = tmprinv(j)+rinv(k)
-          end if
+!>--- first BFS sweep: eccentricities, to size the shell storage
+    dist(:) = -1
+    nlist = 0
+    nlay = 0
+    do i = 1,n
+      if (comp(i) == 0) cycle
+      call bfs_visit(i,nnei,neigh,dist,queue,tail)
+      ecc(i) = dist(queue(tail))
+      nlist = nlist+int(tail-1,int64)
+      nlay = nlay+int(ecc(i),int64)
+      dist(queue(1:tail)) = -1
+    end do
+
+!>--- second sweep: for every atom the atoms of each shell (list) and the
+!>    shell sizes (lsize), in CSR layout starting at lpos/spos
+    allocate (list(max(nlist,1_int64)),lsize(max(nlay,1_int64)))
+    allocate (lpos(n),spos(n))
+    nlist = 0
+    nlay = 0
+    do i = 1,n
+      if (comp(i) == 0) cycle
+      call bfs_visit(i,nnei,neigh,dist,queue,tail)
+      lpos(i) = nlist
+      spos(i) = nlay
+      list(nlist+1:nlist+tail-1) = queue(2:tail)
+      lsize(nlay+1:nlay+ecc(i)) = 0
+      do l = 2,tail
+        d = dist(queue(l))
+        lsize(nlay+d) = lsize(nlay+d)+1
+      end do
+      nlist = nlist+int(tail-1,int64)
+      nlay = nlay+int(ecc(i),int64)
+      dist(queue(1:tail)) = -1
+    end do
+    deallocate (queue,dist)
+
+!>--- accumulate the finite shells, all atoms in step
+    allocate (rinv(n),tmprinv(n),source=1.0_wp)
+    allocate (cur(n),source=0)
+    allocate (buf(n),idx(n))
+    maxecc = maxval(ecc,mask=comp > 0)
+    do d = 1,maxecc
+      tmprinv(:) = 0.0_wp
+      do i = 1,n
+        if (comp(i) == 0) cycle
+        if (ecc(i) < d) cycle
+        nb = lsize(spos(i)+d)
+        do l = 1,nb
+          buf(l) = rinv(list(lpos(i)+cur(i)+l))
         end do
+        tmprinv(i) = ascending_sum(nb,buf,idx)
+        cur(i) = cur(i)+nb
       end do
       rinv(:) = rinv(:)+tmprinv(:)
+      if (maxval(rinv,mask=comp > 0) > bigval) rinv(:) = scale(rinv(:),-512)
     end do
+    deallocate (list,lsize,lpos,spos,cur)
 
-    !>--- put the reversed order of rinv as "actual" invariant
-    k = 1
-    do i = 1,hatms !> the out loop has the maximum possible number of iterations
-      maxrinv = maxval(rinv(:),1)
-      if (maxrinv < 0.0_wp) exit
-      do j = 1,hatms
-        if (rinv(j) >= maxrinv) then
-          inv(j) = k
-          rinv(j) = -1.0_wp
-        end if
+!>--- last shell: all heavy atoms of the other fragments
+    m = count(comp > 0)
+    allocate (hidx(m))
+    hidx(:) = pack([(i,i=1,n)],comp > 0)
+    if (ncomp > 1) then
+      allocate (tsum(ncomp))
+      buf(1:m) = rinv(hidx)
+      call sorted_order(m,buf,idx)
+      do c = 1,ncomp
+        s = 0.0_wp
+        do l = 1,m
+          if (comp(hidx(idx(l))) == c) cycle
+          s = s+buf(idx(l))
+        end do
+        tsum(c) = s
       end do
-      k = k+1
-    end do
+      do l = 1,m
+        rinv(hidx(l)) = rinv(hidx(l))+tsum(comp(hidx(l)))
+      end do
+      deallocate (tsum)
+    end if
 
-    deallocate (tmprinv,rinv)
-    deallocate (tmp)
+!>--- dense rank in descending order; H atoms hold the top rank
+    shift = 0
+    if (any(hnode).and..not.any(csize(:) == 1)) shift = 1
+    buf(1:m) = -rinv(hidx)
+    call sorted_order(m,buf,idx)
+    d = 1
+    do l = 1,m
+      if (l > 1) then
+        if (buf(idx(l)) /= buf(idx(l-1))) d = d+1
+      end if
+      inv(hidx(idx(l))) = d+shift
+    end do
   end subroutine get_invariant0_apsp
+
+  function ascending_sum(n,v,idx) result(s)
+    !***********************************************
+    !* Sum of v(1:n), added in ascending order so
+    !* the result depends only on the multiset.
+    !***********************************************
+    implicit none
+    integer,intent(in) :: n
+    real(wp),intent(in) :: v(:)
+    integer,intent(inout) :: idx(:)
+    real(wp) :: s
+    integer :: i
+    s = 0.0_wp
+    if (n < 1) return
+    call sorted_order(n,v,idx)
+    do i = 1,n
+      s = s+v(idx(i))
+    end do
+  end function ascending_sum
+
+
+!========================================================================================!
+
   function update_invariant0_apsp(inv_in,ati,hneigh) result(inv)
 !************************************************************************
 !* update invariant for atom by appending atom type and number of H atoms
@@ -476,87 +601,198 @@ end subroutine init_canonical_sorter_connect
 !=========================================================================================!
 
   subroutine update_ranks(self)
-!>---update ranks and primes
+    !*************************************************************
+    !* Refine the ranks: the atoms of each rank are split by their
+    !* invariant, and the new ranks are numbered densely in order
+    !* of (old rank, invariant). A sort keeps this O(n log n).
+    !* Also assigns the prime of each new rank.
+    !*************************************************************
     implicit none
     class(canonical_sorter) :: self
-    integer :: maxrank,i,j,ii
-    integer :: newrank,ngroup
-    integer(int64) :: mincurr
-    maxrank = maxval(self%rank,1)
-    newrank = 0
-    !>-- use newinv as workingspace
-    self%newinv(:) = self%invariants(:)
-    RANKLOOP: do i = 1,maxrank
-      ngroup = count(self%rank(:) .eq. i)
-      if (debug) then
-        write (stdout,*) ngroup,' for rank ',i
-      end if
-      !>--- loop over all in the group
-      GROUPLOOP: do ii = 1,ngroup
-        mincurr = minval(self%newinv(:),self%rank(:) .eq. i) !> assign current minimum value within group
-        if (mincurr == huge(mincurr)) cycle RANKLOOP !> cycle if all in group have been assigned
-        newrank = newrank+1
-        ASSIGNLOOP: do j = 1,self%hatms
-          if (self%rank(j) == i.and.self%newinv(j) == mincurr) then
-            self%newrank(j) = newrank
-            if (debug) then
-              write (stdout,*) 'new rank',newrank,'assigned to atom',j
-            end if
-            self%newinv(j) = huge(mincurr) !> remove this minimum value
-          end if
-        end do ASSIGNLOOP
-      end do GROUPLOOP
-    end do RANKLOOP
+    integer,allocatable :: idx(:),work(:)
+    integer :: i,n,r
+    n = self%hatms
+    if (n < 1) return
+    allocate (idx(n),work(n))
+    do i = 1,n
+      idx(i) = i
+    end do
+    call sort_atoms(self,idx,work,1,n)
+    r = 1
+    self%newrank(idx(1)) = r
+    do i = 2,n
+      if (compare_atoms(self,idx(i-1),idx(i)) /= 0) r = r+1
+      self%newrank(idx(i)) = r
+      if (debug) write (stdout,*) 'new rank',r,'assigned to atom',idx(i)
+    end do
 !>--- assign primes
-    do i = 1,self%hatms
-      !self%rank(i) = self%newrank(i) !> do this outside of routine
-      self%prime(i) = nth_prime(self%newrank(i))
+    do i = 1,n
+      self%prime(i) = self%primetab(self%newrank(i))
     end do
   end subroutine update_ranks
 
 !=========================================================================================!
 
-  subroutine update_invariants(self)
-!>---update invariants
+  recursive subroutine sort_atoms(self,idx,work,lo,hi)
+    !*********************************************
+    !* Merge sort of idx(lo:hi) by compare_atoms.
+    !*********************************************
     implicit none
-    class(canonical_sorter) :: self
-    integer :: i,j
-    integer(int64) :: invprod
-    do i = 1,self%hatms
-      invprod = 1
-      !>--- loop over all heavy-atom neighbours of i
-      do j = 1,self%hatms
-        if (self%hadjac(j,i) > 0) then
-          invprod = invprod*self%prime(j)
+    class(canonical_sorter),intent(in) :: self
+    integer,intent(inout) :: idx(:),work(:)
+    integer,intent(in) :: lo,hi
+    integer :: mid,i,j,k
+    if (hi <= lo) return
+    mid = (lo+hi)/2
+    call sort_atoms(self,idx,work,lo,mid)
+    call sort_atoms(self,idx,work,mid+1,hi)
+    i = lo
+    j = mid+1
+    k = lo
+    do while (i <= mid.and.j <= hi)
+      if (compare_atoms(self,idx(j),idx(i)) < 0) then
+        work(k) = idx(j)
+        j = j+1
+      else
+        work(k) = idx(i)
+        i = i+1
+      end if
+      k = k+1
+    end do
+    work(k:k+mid-i) = idx(i:mid)
+    k = k+mid-i+1
+    work(k:hi) = idx(j:hi)
+    idx(lo:hi) = work(lo:hi)
+  end subroutine sort_atoms
+
+  integer function compare_atoms(self,a,b) result(c)
+    !****************************************************************
+    !* Order of atoms a and b by (rank, invariant): -1, 0 or 1.
+    !* An overflowed prime product is larger than any int64 one; two
+    !* overflowed ones are ordered by their sorted neighbour primes,
+    !* which is equal exactly when the products are.
+    !****************************************************************
+    implicit none
+    class(canonical_sorter),intent(in) :: self
+    integer,intent(in) :: a,b
+    integer :: pa(self%maxnei),pb(self%maxnei),na,nb,l
+    c = 0
+    if (self%rank(a) /= self%rank(b)) then
+      c = merge(-1,1,self%rank(a) < self%rank(b))
+    else if (self%ovf(a).neqv.self%ovf(b)) then
+      c = merge(1,-1,self%ovf(a))
+    else if (.not.self%ovf(a)) then
+      if (self%invariants(a) /= self%invariants(b)) then
+        c = merge(-1,1,self%invariants(a) < self%invariants(b))
+      end if
+    else
+      na = self%nhnei(a)
+      nb = self%nhnei(b)
+      if (na /= nb) then
+        c = merge(-1,1,na < nb)
+        return
+      end if
+      pa(1:na) = self%prime(self%hneigh(1:na,a))
+      pb(1:nb) = self%prime(self%hneigh(1:nb,b))
+      call isort(pa(1:na))
+      call isort(pb(1:nb))
+      do l = 1,na
+        if (pa(l) /= pb(l)) then
+          c = merge(-1,1,pa(l) < pb(l))
+          return
         end if
       end do
-      self%newinv(i) = invprod
+    end if
+  end function compare_atoms
+
+
+!=========================================================================================!
+
+  subroutine update_invariants(self)
+    !****************************************************************
+    !* New invariant of each atom: the product of the primes of its
+    !* heavy neighbours' ranks. A product that would overflow int64
+    !* is flagged in ovf instead and compared via its factors.
+    !****************************************************************
+    implicit none
+    class(canonical_sorter) :: self
+    integer :: i,l
+    integer(int64) :: invprod,p
+    do i = 1,self%hatms
+      invprod = 1
+      self%ovf(i) = .false.
+      do l = 1,self%nhnei(i)
+        p = int(self%prime(self%hneigh(l,i)),int64)
+        if (invprod > huge(invprod)/p) then
+          self%ovf(i) = .true.
+          invprod = 0
+          exit
+        end if
+        invprod = invprod*p
+      end do
+      self%invariants(i) = invprod
     end do
     if (debug) write (stdout,*) 'update invariants'
-    self%invariants(:) = self%newinv(:)
   end subroutine update_invariants
 
 !========================================================================================!
 
-  recursive subroutine iterate(self,mol)
+  subroutine iterate(self,mol)
+    !*************************************************
+    !* Refine ranks and invariants until the ranking
+    !* no longer changes.
+    !*************************************************
     implicit none
     class(canonical_sorter) :: self
     type(coord) :: mol
-    call self%update_ranks()
-    if (debug) then
-      call debugprint(self,mol)
-    end if
-    if (all(self%rank(:) .eq. self%newrank(:))) then
-      return  !> termination condition
-    else
+    do
+      call self%update_ranks()
+      if (debug) then
+        call debugprint(self,mol)
+      end if
+      if (all(self%rank(:) .eq. self%newrank(:))) exit  !> termination condition
       self%rank(:) = self%newrank(:)
-    end if
-    call self%update_invariants()
-    if (debug) then
-      call debugprint(self,mol)
-    end if
-    call self%iterate(mol)
+      call self%update_invariants()
+      if (debug) then
+        call debugprint(self,mol)
+      end if
+    end do
   end subroutine iterate
+
+!========================================================================================!
+
+  subroutine renumber_heavy_ranks(self,mol)
+    !******************************************************************
+    !* With H atoms carried as graph nodes (heavy=.false.), number the
+    !* heavy-atom ranks densely from 1 while keeping their order, and
+    !* set the H entries to 0 for add_h_ranks. The H nodes normally
+    !* form rank 1 alone, which makes this a shift by one.
+    !******************************************************************
+    implicit none
+    class(canonical_sorter),intent(inout) :: self
+    type(coord),intent(in) :: mol
+    integer,allocatable :: newnum(:)
+    integer :: i,r
+    if (self%hatms < 1) return
+    allocate (newnum(maxval(self%rank)),source=0)
+    do i = 1,self%hatms
+      if (mol%at(self%hmap(i)) .ne. 1) newnum(self%rank(i)) = 1
+    end do
+    r = 0
+    do i = 1,size(newnum)
+      if (newnum(i) > 0) then
+        r = r+1
+        newnum(i) = r
+      end if
+    end do
+    do i = 1,self%hatms
+      if (mol%at(self%hmap(i)) .eq. 1) then
+        self%rank(i) = 0
+      else
+        self%rank(i) = newnum(self%rank(i))
+      end if
+    end do
+  end subroutine renumber_heavy_ranks
 
 !========================================================================================!
 
@@ -750,10 +986,8 @@ end subroutine init_canonical_sorter_connect
     do i = 1,self%hatms
       if (mol%at(i) .ne. 1) cycle
       ii = self%neigh(1,i)
-      if(ii < 1)then
-        !> Edge-case: "unbound"" hydrogens (H⁺,H2, etc.), skip those here
-        cycle
-      endif
+      if (ii < 1) cycle  !> Edge-case: "unbound" hydrogens (H+, H2, etc.), skip those here
+      if (mol%at(ii) .eq. 1) cycle
       jj = self%rank(ii)
       rankmap(jj) = 1
     end do
@@ -763,21 +997,60 @@ end subroutine init_canonical_sorter_connect
         rankmap(i) = maxrank+rr
       end if
     end do
-    !> new maxrank(+1)
-    maxrank = maxval(rankmap(:),1)
+    !> one more rank above all others for the unbound H
+    maxrank = max(maxrank,maxval(rankmap(:),1))+1
     do i = 1,self%hatms
       if (mol%at(i) .ne. 1) cycle
       ii = self%neigh(1,i)
-      if(ii < 1)then 
-        !> again, taking care of the "unbound" H edge-case --> separate maxrank+1 for all of them
+      unbound: block
+        if (ii >= 1) then
+          if (mol%at(ii) .ne. 1) exit unbound
+        end if
+        !> "unbound" H (no neighbour, or only H neighbours) share one extra rank
         self%rank(i) = maxrank
         cycle
-      endif 
+      end block unbound
       jj = self%rank(ii)
       self%rank(i) = rankmap(jj)
     end do
     deallocate (rankmap)
   end subroutine add_h_ranks
+
+!========================================================================================!
+
+  function same_graph(self,ref,mol) result(yesno)
+    !*****************************************************************
+    !* .true. if mol has the atom types of ref and the connectivity
+    !* stored in self, which must have been set up from ref by init
+    !* (or init_graph) without a wbo matrix. The ranks depend on
+    !* nothing else, so they can then be copied from ref to mol
+    !* instead of being recomputed.
+    !*****************************************************************
+    implicit none
+    class(canonical_sorter),intent(in) :: self
+    type(coord),intent(in) :: ref,mol
+    logical :: yesno
+    integer,allocatable :: A(:,:)
+    integer :: i,j,l
+    yesno = .false.
+    if (.not.allocated(self%neigh)) return
+    if (ref%nat .ne. self%nat.or.mol%nat .ne. self%nat) return
+    if (any(mol%at(:) .ne. ref%at(:))) return
+    call mol%cn_to_adjacency(A)
+    do i = 1,mol%nat
+      l = 0
+      do j = 1,mol%nat
+        if (A(j,i) .eq. 0) cycle
+        l = l+1
+        if (l > self%maxnei) return
+        if (self%neigh(l,i) .ne. j) return
+      end do
+      if (l < self%maxnei) then
+        if (self%neigh(l+1,i) .ne. 0) return
+      end if
+    end do
+    yesno = .true.
+  end function same_graph
 
 !========================================================================================!
 

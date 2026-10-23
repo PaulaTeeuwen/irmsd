@@ -145,3 +145,46 @@ def get_irmsd_fortran_raw(
         coords_out2_flat,
     )
     return rmsd[0]
+
+
+# void get_bond_mismatch_fortran(int n, int* types1, double* coords1,
+#                                int* types2, double* coords2, int* nmis, int* atmis)
+LIB.get_bond_mismatch_fortran.argtypes = [
+    ct.c_int,
+    ndpointer(dtype=np.int32, flags="C_CONTIGUOUS"),
+    ndpointer(dtype=np.float64, flags="C_CONTIGUOUS"),
+    ndpointer(dtype=np.int32, flags="C_CONTIGUOUS"),
+    ndpointer(dtype=np.float64, flags="C_CONTIGUOUS"),
+    ct.POINTER(ct.c_int),
+    ndpointer(dtype=np.int32, flags="C_CONTIGUOUS"),
+]
+LIB.get_bond_mismatch_fortran.restype = None
+
+
+def get_bond_mismatch_fortran_raw(
+    n: int,
+    types1: np.ndarray,  # (n,) int32 C
+    coords1_flat: np.ndarray,  # (3*n,) float64 C
+    types2: np.ndarray,  # (n,) int32 C
+    coords2_flat: np.ndarray,  # (3*n,) float64 C
+    atmis: np.ndarray,  # (n,) int32 C, output
+) -> int:
+    """Low-level call that matches the Fortran signature exactly. Fills
+    ``atmis`` in place and returns the number of mismatched atom pairs."""
+    for name, arr, dtype, size in (
+        ("types1", types1, np.int32, n),
+        ("types2", types2, np.int32, n),
+        ("atmis", atmis, np.int32, n),
+        ("coords1_flat", coords1_flat, np.float64, 3 * n),
+        ("coords2_flat", coords2_flat, np.float64, 3 * n),
+    ):
+        if arr.dtype != dtype or not arr.flags.c_contiguous:
+            raise TypeError(f"{name} must be {np.dtype(dtype).name} and C-contiguous")
+        if arr.size != size:
+            raise ValueError(f"{name} must have {size} entries")
+
+    nmis = ct.c_int(0)
+    LIB.get_bond_mismatch_fortran(
+        int(n), types1, coords1_flat, types2, coords2_flat, ct.byref(nmis), atmis
+    )
+    return nmis.value

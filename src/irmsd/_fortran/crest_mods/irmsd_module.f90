@@ -514,11 +514,12 @@ contains  !> MODULE PROCEDURES START HERE
     real(wp) :: calc_rmsd
     real(wp) :: tmprmsd_sym(32)
     real(wp) :: rotmat(3,3),rotconst(3),shift(3)
-    logical :: topocheck_l = .true.
+    logical :: topocheck_l
     logical,parameter :: debug = .false.
 
-!>--- defaults
+!>--- defaults (not in the declaration: that would imply SAVE)
     ioloc = 0
+    topocheck_l = .true.
 
 !>--- Initialization
     if (present(rcache)) then
@@ -579,14 +580,14 @@ contains  !> MODULE PROCEDURES START HERE
 
 !>--- Count symmetry equivalent groups and assign all unique atoms immediately
 !     Note, the rank can be zero if we only are looking at heavy atoms
-    if (all(cptr%ngroup(:) .eq. 0)) then
-      do ii = 1,ref%nat
-        rnk = cptr%rank(ii,1)
-        if (rnk > 0) then
-          cptr%ngroup(rnk) = cptr%ngroup(rnk)+1
-        end if
-      end do
-    end if
+!     Recount every call: a reused cache may hold another pair's counts
+    cptr%ngroup(:) = 0
+    do ii = 1,ref%nat
+      rnk = cptr%rank(ii,1)
+      if (rnk > 0) then
+        cptr%ngroup(rnk) = cptr%ngroup(rnk)+1
+      end if
+    end do
     !> assignment reset
     cptr%assigned(:) = .false.
     cptr%rassigned(:) = .false.
@@ -832,10 +833,10 @@ contains  !> MODULE PROCEDURES START HERE
     !> LOCAL
     type(rmsd_cache),pointer :: cptr
     type(rmsd_cache),allocatable,target :: local_rcache
-    logical :: align_l = .true.
-    logical :: topocheck_l = .true.
-    logical :: allcanon_l = .false.
-    integer :: io_l = 0
+    logical :: align_l
+    logical :: topocheck_l
+    logical :: allcanon_l
+    integer :: io_l
     real(wp) ::tmpd(3),tmpdist
     integer :: i,ich
     logical :: mirror
@@ -845,6 +846,10 @@ contains  !> MODULE PROCEDURES START HERE
     call axis(ref%nat,ref%at,ref%xyz)
 
     !> optional args
+    align_l = .true.
+    topocheck_l = .true.
+    allcanon_l = .false.
+    io_l = 0
     if (present(align)) align_l = align
     if (present(topocheck)) topocheck_l = topocheck
     if (present(allcanon)) allcanon_l = allcanon
@@ -935,18 +940,21 @@ contains  !> MODULE PROCEDURES START HERE
       call canref%init(ref,invtype='apsp+',heavy=.false.)
       r1(:) = canref%rank(:)
       refstereo = canref%hasstereo(ref)
-      call canref%shrink()
     end if
 
-    !> mobile ranks
+    !> mobile ranks; with the same atom types and bonds as ref they are
+    !> ref's ranks, and mol need not be canonicalized again
     allocate (r2(mol%nat))
     if (mol_provided) then
       r2(:) = mol%id(:)
+    else if (canref%same_graph(ref,mol)) then
+      r2(:) = r1(:)
     else
       call canmol%init(mol,invtype='apsp+',heavy=.false.)
       r2(:) = canmol%rank(:)
       call canmol%shrink()
     end if
+    call canref%shrink()
 
     !> if provided ranks do not reconcile, recompute the provided side(s)
     if (.not.checkranks(ref%nat,r1,r2).and. (ref_provided.or.mol_provided)) then
@@ -1303,8 +1311,8 @@ contains  !> MODULE PROCEDURES START HERE
     integer,intent(in) :: nat
     integer,intent(in) :: ranks1(nat)
     integer,intent(in) :: ranks2(nat)
-    integer :: ii,jj,maxrank1,maxrank2
-    integer :: count1,count2
+    integer :: jj,maxrank1,maxrank2
+    integer,allocatable :: diff(:)
     yesno = .false.
 
     maxrank1 = maxval(ranks1)
@@ -1312,16 +1320,14 @@ contains  !> MODULE PROCEDURES START HERE
     !> different maxranks, so we can't have the same and return
     if (maxrank1 .ne. maxrank2) return
 
-    do ii = 1,maxrank1
-      count1 = 0
-      count2 = 0
-      do jj = 1,nat
-        if (ranks1(jj) .eq. ii) count1 = count1+1
-        if (ranks2(jj) .eq. ii) count2 = count2+1
-      end do
-      !> not the same amount of atoms in rank ii, return from function
-      if (count1 .ne. count2) return
+    !> per-rank count difference; ranks below 1 are not counted
+    allocate (diff(max(maxrank1,0)),source=0)
+    do jj = 1,nat
+      if (ranks1(jj) >= 1) diff(ranks1(jj)) = diff(ranks1(jj))+1
+      if (ranks2(jj) >= 1) diff(ranks2(jj)) = diff(ranks2(jj))-1
     end do
+    !> not the same amount of atoms in some rank, return from function
+    if (any(diff /= 0)) return
 
     !> if we reach this point we can assume the given ranks are o.k.
     yesno = .true.

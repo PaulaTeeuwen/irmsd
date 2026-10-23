@@ -83,8 +83,11 @@ contains  !> MODULE PROCEDURES START HERE
 
 !================================================================================!
 
-!>--- set up tracking array frag: vertex->fragment
   subroutine setup_fragments(V,A,frag)
+    !***************************************************
+    !* Set up tracking array frag: vertex -> fragment.
+    !* BFS over the neighbour list built from A.
+    !***************************************************
     implicit none
     !> INPUT
     integer,intent(in) :: V
@@ -92,27 +95,105 @@ contains  !> MODULE PROCEDURES START HERE
     !> OUTPUT
     integer,allocatable,intent(out) :: frag(:)
     !> LOCAL
-    integer :: i,j,k,nfrag
-    integer,allocatable :: tmp(:)
-    if(allocated(frag)) deallocate(frag)
-    allocate(frag(V))
-    frag = 0
-    nfrag = 0
-    allocate (tmp(V),source=0)
-    !> sweeps
-    do i = 1,V
-      if (frag(i) == 0) then
-        nfrag = nfrag + 1
-        j = i
-        k = 1
-        tmp = 0
-        call visit_adjacent(j,V,A,tmp,k)
-        do j = 1,V
-          if (any(tmp(:) == j)) frag(j) = nfrag
-        end do
-      end if
-    end do
+    integer,allocatable :: nnei(:),neigh(:,:)
+    integer :: nfrag
+    allocate (frag(V))
+    call adjacency_to_neighbours(V,A,nnei,neigh)
+    call neighbour_fragments(V,nnei,neigh,frag,nfrag)
   end subroutine setup_fragments
+
+!================================================================================!
+
+  subroutine adjacency_to_neighbours(V,A,nnei,neigh)
+    !*********************************************************
+    !* Neighbour list of an adjacency matrix: neigh(1:nnei(i),i)
+    !* are the vertices bonded to i, in ascending order.
+    !*********************************************************
+    implicit none
+    integer,intent(in) :: V
+    integer,intent(in) :: A(V,V)
+    integer,allocatable,intent(out) :: nnei(:),neigh(:,:)
+    integer :: i,j
+    allocate (nnei(V),source=0)
+    do i = 1,V
+      nnei(i) = count(A(:,i) > 0)
+    end do
+    allocate (neigh(max(maxval(nnei,1),1),V),source=0)
+    nnei(:) = 0
+    do i = 1,V
+      do j = 1,V
+        if (A(j,i) > 0) then
+          nnei(i) = nnei(i)+1
+          neigh(nnei(i),i) = j
+        end if
+      end do
+    end do
+  end subroutine adjacency_to_neighbours
+
+!================================================================================!
+
+  subroutine bfs_visit(src,nnei,neigh,dist,queue,nvis)
+    !******************************************************************
+    !* Breadth-first search from src over a neighbour list.
+    !* On entry dist(:) must be negative for all unvisited vertices.
+    !* On exit queue(1:nvis) holds the reached vertices in order of
+    !* nondecreasing distance (src first) and dist their graph
+    !* distance to src. Reset dist(queue(1:nvis)) before the next call.
+    !******************************************************************
+    implicit none
+    integer,intent(in) :: src
+    integer,intent(in) :: nnei(:),neigh(:,:)
+    integer,intent(inout) :: dist(:),queue(:)
+    integer,intent(out) :: nvis
+    integer :: head,j,k,l
+    dist(src) = 0
+    queue(1) = src
+    head = 1
+    nvis = 1
+    do while (head <= nvis)
+      j = queue(head)
+      do l = 1,nnei(j)
+        k = neigh(l,j)
+        if (dist(k) >= 0) cycle
+        dist(k) = dist(j)+1
+        nvis = nvis+1
+        queue(nvis) = k
+      end do
+      head = head+1
+    end do
+  end subroutine bfs_visit
+
+!================================================================================!
+
+  subroutine neighbour_fragments(V,nnei,neigh,frag,nfrag,mask)
+    !****************************************************************
+    !* Connected components of a graph given as neighbour list.
+    !* frag(i) is the fragment index of vertex i, nfrag their number.
+    !* With mask, only vertices with mask(i) = .true. are considered;
+    !* the others get frag(i) = 0 and are never entered.
+    !****************************************************************
+    implicit none
+    integer,intent(in) :: V
+    integer,intent(in) :: nnei(:),neigh(:,:)
+    integer,intent(out) :: frag(:)
+    integer,intent(out) :: nfrag
+    logical,intent(in),optional :: mask(:)
+    integer,allocatable :: dist(:),queue(:)
+    integer :: i,nvis
+    allocate (dist(V),queue(V))
+    dist(:) = -1
+    if (present(mask)) then
+      where (.not.mask(1:V)) dist(1:V) = 0
+    end if
+    frag(1:V) = 0
+    nfrag = 0
+    do i = 1,V
+      if (dist(i) >= 0) cycle
+      nfrag = nfrag+1
+      call bfs_visit(i,nnei,neigh,dist,queue,nvis)
+      frag(queue(1:nvis)) = nfrag
+    end do
+  end subroutine neighbour_fragments
 
 !================================================================================!
 

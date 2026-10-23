@@ -9,6 +9,8 @@ list(APPEND srcs
   "${dir}/axis_exposed.f90"
   "${dir}/canonical_exposed.f90"
   "${dir}/rmsd_exposed.f90"
+  "${dir}/irmsd_walk.f90"
+  "${dir}/irmsd_refine.f90"
   "${dir}/irmsd_exposed.f90"
   "${dir}/sorter_exposed.f90"
   "${dir}/symmetry_i.f90"

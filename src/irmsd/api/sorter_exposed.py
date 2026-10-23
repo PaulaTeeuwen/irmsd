@@ -399,3 +399,19 @@ def cregen_raw(
     energies_list = [energies[i].copy() for i in range(nall)]
 
     return groups, xyz_structs, energies_list
+
+
+def openmp_info() -> dict:
+    """
+    Report how the compiled library handles parallel sorting.
+
+    Returns
+    -------
+    dict
+        ``enabled``: True if the library was built with OpenMP.
+        ``max_threads``: number of threads the iRMSD sorter uses per parallel
+        region (``OMP_NUM_THREADS`` if set, otherwise all available cores;
+        1 without OpenMP).
+    """
+    enabled, max_threads = _F.get_openmp_info_fortran_raw()
+    return {"enabled": bool(enabled), "max_threads": max_threads}

@@ -51,11 +51,13 @@ build = ["cp310-*", "cp311-*", "cp312-*", "cp313-*", "cp314-*"]
 skip = ["pp*", "*-musllinux*"]
 test-command = "pytest -q {project}/tests"
 test-requires = ["pytest", "numpy"]
+# the wheel tests check that OpenMP really made it into the wheel
+test-environment = { IRMSD_EXPECT_OPENMP = "1" }
 
 [tool.cibuildwheel.linux]
 before-all = "yum install -y gcc-gfortran"
-environment = { FC = "gfortran" }
+environment = { FC = "gfortran", SKBUILD_CMAKE_DEFINE = "IRMSD_REQUIRE_OPENMP=ON" }
 
 [tool.cibuildwheel.macos]
-environment = { FC = "gfortran" }
+environment = { FC = "gfortran", SKBUILD_CMAKE_DEFINE = "IRMSD_REQUIRE_OPENMP=ON" }
 

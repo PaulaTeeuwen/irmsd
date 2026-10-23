@@ -6,14 +6,17 @@ module sorter_exposed
   use axis_module
   use irmsd_module
   use canonical_mod
+  use irmsd_refine,only:refine_assignment
   use utilities,only:qsorti
   use term_ui
+  !$ use omp_lib
   implicit none
   private
 
   public :: sorter_exposed_xyz_fortran
   public :: delta_irmsd_list_fortran
   public :: cregen_exposed_fortran
+  public :: get_openmp_info_fortran
 
 !================================================================================!
 contains  !> MODULE PROCEDURES START HERE
@@ -174,18 +177,20 @@ contains  !> MODULE PROCEDURES START HERE
     real(wp),intent(in),optional :: ETHR
 
     !> LOCAL
-    integer :: i,ii,jj,T,cc,nat,io
+    integer :: i,ii,jj,T,cc,nat,io,ioref
+    real(wp) :: rmsdref
     integer :: gcount,ggcount
     integer :: prlvl
     type(rmsd_cache),allocatable :: rcaches(:)
     type(coord),allocatable,target :: workmols(:)
-    type(canonical_sorter) :: scratch
+    type(canonical_sorter) :: scratch,lastcan
+    integer :: lastid
     integer,allocatable :: ranks_all(:,:)
     logical,allocatable :: has_id(:)
     type(coord),pointer :: ref,mol
     real(wp) :: rmsdval,RTHR,ediff,eii
     integer,allocatable :: prune_table(:)
-    integer,allocatable :: topo_group(:)
+    integer,allocatable :: topo_class(:)
     logical :: stereocheck,individual_IDs
     type(progress_state) :: ps
     character(len=:),allocatable :: tmpstr
@@ -205,8 +210,8 @@ contains  !> MODULE PROCEDURES START HERE
     end if
 
 !>--- set up parallelization
-!     ...
-    T = 1 !> doing it serial for now
+    T = 1
+    !$ T = omp_get_max_threads()
 
 !>--- set up parameters (NOTE, we are working with BOHR internally)
     RTHR = RTHRESH*aatoau
@@ -224,7 +229,7 @@ contains  !> MODULE PROCEDURES START HERE
       if (present(ETHR)) then
         write (stdout,'(2x,a,es10.2,a)') 'ETHR (energy threshold)  :',ETHR,' Ha'
       end if
-      !write (stdout,'(2x,a,i9)') 'OpenMP threads           :',T
+      write (stdout,'(2x,a,i10)') 'OpenMP threads           :',T
       write (stdout,'(2x,a,l10)') 'Individual atom IDs?     :',individual_IDs
       write (stdout,'(2x,a)',advance='no') 'False enantiomer check?  :'
       select case (iinversion)
@@ -255,6 +260,7 @@ contains  !> MODULE PROCEDURES START HERE
     nat = ref%nat
     allocate (ranks_all(nat,nall),source=0)
     allocate (has_id(nall),source=.false.)
+    lastid = 0
     if (prlvl > 0) then
       write (stdout,'(a,9x,a)',advance='no') 'Setting up atom IDs','... '
       flush (stdout)
@@ -278,18 +284,23 @@ contains  !> MODULE PROCEDURES START HERE
             stereocheck = .not. (scratch%hasstereo(ref))
             call scratch%deallocate()
           end if
+        else if (lastid > 0.and.lastcan%same_graph(structures(lastid),mol)) then
+          !> same atom types and bonds as the last computed structure
+          ranks_all(1:nat,ii) = ranks_all(1:nat,lastid)
         else
           !> recompute the canonical ranks for this structure
-          call scratch%init(mol,invtype='apsp+',heavy=.false.)
-          ranks_all(1:nat,ii) = scratch%rank(1:nat)
-          if (ii == 1) stereocheck = .not. (scratch%hasstereo(ref))
-          call scratch%deallocate()
+          call lastcan%deallocate()
+          call lastcan%init(mol,invtype='apsp+',heavy=.false.)
+          ranks_all(1:nat,ii) = lastcan%rank(1:nat)
+          if (ii == 1) stereocheck = .not. (lastcan%hasstereo(ref))
+          lastid = ii
         end if
       end if
       if (prlvl > 1) then
         call progress_update(ps,ii,nall)
       end if
     end do
+    call lastcan%deallocate()
     !> in the shared-id mode, broadcast structure 1's ranks to all others
     if (.not.individual_IDs) then
       do ii = 2,nall
@@ -363,9 +374,12 @@ contains  !> MODULE PROCEDURES START HERE
       end do
     end if
 
-    !> topo_group dynamically keeps track of different topology groups
-    !> among the structures. All structures start out as the same topology
-    allocate (topo_group(nall),source=1)
+    !> topology classes up front; different classes never match. Provided ids
+    !> may be replaced per pair (fallbackranks), so then min_rmsd decides.
+    allocate (topo_class(nall),source=1)
+    if (.not.any(has_id)) then
+      call assign_topo_classes(nall,nat,structures,ranks_all,topo_class)
+    end if
 !> --------------------------------------------
 !> pre-processing end
 !> --------------------------------------------
@@ -390,17 +404,14 @@ contains  !> MODULE PROCEDURES START HERE
       groups(ii) = gcount
 
 !>--- Then, cross-check all other unassigned conformers
-      cc = 1  !> again, serial implementation for now
-      ! !$omp parallel &
-      ! !$omp shared(nall, nat, groups, individual_IDs, sorters, rcaches) &
-      ! !$omp shared(workmols, structures, ii, prune_table,topo_group) &
-      ! !$omp private(jj,rmsdval,cc,io)
-      ! !$omp do schedule(dynamic)
+      !$omp parallel do schedule(dynamic) default(shared) &
+      !$omp private(jj,cc,rmsdval,rmsdref,io,ioref)
       do jj = ii+1,nall
-        !cc = omp_get_thread_num()+1
+        cc = 1
+        !$ cc = omp_get_thread_num()+1
         if (groups(jj) .ne. 0) cycle
         if (ii < prune_table(jj)) cycle
-        if (topo_group(ii) .ne. topo_group(jj)) cycle
+        if (topo_class(ii) .ne. topo_class(jj)) cycle
         rcaches(cc)%rank(1:nat,1) = ranks_all(1:nat,ii)
         rcaches(cc)%rank(1:nat,2) = ranks_all(1:nat,jj)
         !> if a provided id is involved, make sure the two rank sets are
@@ -415,18 +426,17 @@ contains  !> MODULE PROCEDURES START HERE
         workmols(cc)%xyz(:,:) = structures(jj)%xyz(:,:)
         call min_rmsd(structures(ii),workmols(cc), &
         &        rcache=rcaches(cc),rmsdout=rmsdval,io=io)
-        if (io .ne. 0) then
-          topo_group(jj) = topo_group(jj)+1
-          cycle
-        end if
+        if (io .ne. 0) cycle
+        call refine_assignment(structures(ii),workmols(cc), &
+        &        rcaches(cc)%rank(1:nat,1),rcaches(cc)%stereocheck,rmsdref,ioref)
+        if (ioref == 0) rmsdval = rmsdref
         if (rmsdval < RTHR) groups(jj) = gcount
 
       end do
+      !$omp end parallel do
       if (prlvl > 1) then
         call progress_update(ps,ii,nall)
       end if
-      ! !$omp end do
-      ! !$omp end parallel
     end do
     if (prlvl > 0) then
       if (prlvl > 1) then
@@ -437,9 +447,46 @@ contains  !> MODULE PROCEDURES START HERE
       end if
     end if
 
-    if (allocated(topo_group)) deallocate (topo_group)
+    if (allocated(topo_class)) deallocate (topo_class)
     if (allocated(prune_table)) deallocate (prune_table)
   end subroutine cregen_irmsd_sort
+
+  subroutine assign_topo_classes(nall,nat,structures,ranks,tclass)
+!*****************************************************************
+!* Topology classes: same class iff the sorted (rank, atom type) lists match
+!*****************************************************************
+    implicit none
+    integer,intent(in) :: nall,nat
+    type(coord),intent(in) :: structures(nall)
+    integer,intent(in) :: ranks(nat,nall)
+    integer,intent(out) :: tclass(nall)
+    integer,allocatable :: sig(:,:),key(:),cur(:),ix(:)
+    integer :: ii,k,nclass
+
+    allocate (sig(nat,nall),key(nat),cur(nat),ix(nat))
+    nclass = 0
+    do ii = 1,nall
+      do k = 1,nat
+        key(k) = ranks(k,ii)*256+structures(ii)%at(k)
+        ix(k) = k
+      end do
+      call qsorti(key,ix,1,nat)
+      cur(:) = key(ix)
+      tclass(ii) = 0
+      do k = 1,nclass
+        if (all(cur .eq. sig(:,k))) then
+          tclass(ii) = k
+          exit
+        end if
+      end do
+      if (tclass(ii) == 0) then
+        nclass = nclass+1
+        sig(:,nclass) = cur
+        tclass(ii) = nclass
+      end if
+    end do
+    deallocate (sig,key,cur,ix)
+  end subroutine assign_topo_classes
 
   subroutine delta_irmsd_list(nall,structures,iinversion,delta,allcanon,printlvl)
 !*******************************************************************
@@ -456,11 +503,13 @@ contains  !> MODULE PROCEDURES START HERE
     integer,intent(in),optional :: printlvl
 
     !> LOCAL
-    integer :: i,ii,jj,T,cc,nat
+    integer :: i,ii,jj,T,cc,nat,io,ioref
+    real(wp) :: rmsdref
     integer :: prlvl
     type(rmsd_cache),allocatable :: rcaches(:)
     type(coord),allocatable,target :: workmols(:)
-    type(canonical_sorter) :: scratch
+    type(canonical_sorter) :: scratch,lastcan
+    integer :: lastid
     integer,allocatable :: ranks_all(:,:)
     logical,allocatable :: has_id(:)
     type(coord),pointer :: ref,mol
@@ -510,6 +559,7 @@ contains  !> MODULE PROCEDURES START HERE
     nat = ref%nat
     allocate (ranks_all(nat,nall),source=0)
     allocate (has_id(nall),source=.false.)
+    lastid = 0
     do ii = 1,nall
       mol => structures(ii)
       call axis(mol%nat,mol%at,mol%xyz)
@@ -522,14 +572,18 @@ contains  !> MODULE PROCEDURES START HERE
             stereocheck = .not. (scratch%hasstereo(ref))
             call scratch%deallocate()
           end if
+        else if (lastid > 0.and.lastcan%same_graph(structures(lastid),mol)) then
+          ranks_all(1:nat,ii) = ranks_all(1:nat,lastid)
         else
-          call scratch%init(mol,invtype='apsp+',heavy=.false.)
-          ranks_all(1:nat,ii) = scratch%rank(1:nat)
-          if (ii == 1) stereocheck = .not. (scratch%hasstereo(ref))
-          call scratch%deallocate()
+          call lastcan%deallocate()
+          call lastcan%init(mol,invtype='apsp+',heavy=.false.)
+          ranks_all(1:nat,ii) = lastcan%rank(1:nat)
+          if (ii == 1) stereocheck = .not. (lastcan%hasstereo(ref))
+          lastid = ii
         end if
       end if
     end do
+    call lastcan%deallocate()
     if (.not.individual_IDs) then
       do ii = 2,nall
         ranks_all(1:nat,ii) = ranks_all(1:nat,1)
@@ -593,7 +647,12 @@ contains  !> MODULE PROCEDURES START HERE
       workmols(cc)%at(:) = structures(ii)%at(:)
       workmols(cc)%xyz(:,:) = structures(ii)%xyz(:,:)
       call min_rmsd(structures(jj),workmols(cc), &
-      &        rcache=rcaches(cc),rmsdout=rmsdval,topocheck=.true.)
+      &        rcache=rcaches(cc),rmsdout=rmsdval,topocheck=.true.,io=io)
+      if (io == 0) then
+        call refine_assignment(structures(jj),workmols(cc), &
+        &        rcaches(cc)%rank(1:nat,1),rcaches(cc)%stereocheck,rmsdref,ioref)
+        if (ioref == 0) rmsdval = rmsdref
+      end if
       delta(ii) = rmsdval
       ! !$omp end do
       ! !$omp end parallel
@@ -1029,6 +1088,27 @@ contains  !> MODULE PROCEDURES START HERE
     structures = structures(ix)
     deallocate (energies,ix)
   end subroutine structures_esort
+
+!=============================================================================!
+
+  subroutine get_openmp_info_fortran(enabled,max_threads) &
+    &        bind(C,name="get_openmp_info_fortran")
+    !**********************************************************
+    !* Report whether the library was built with OpenMP, and
+    !* how many threads a parallel region would use now
+    !* (OMP_NUM_THREADS, else all available cores).
+    !*
+    !* enabled     : (out) 1 if built with OpenMP, else 0
+    !* max_threads : (out) threads per parallel region; 1
+    !*               without OpenMP
+    !**********************************************************
+    implicit none
+    integer(c_int),intent(out) :: enabled,max_threads
+    enabled = 0
+    max_threads = 1
+    !$ enabled = 1
+    !$ max_threads = int(omp_get_max_threads(),c_int)
+  end subroutine get_openmp_info_fortran
 
 !=============================================================================!
 !#############################################################################!

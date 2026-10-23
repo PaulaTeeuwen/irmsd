@@ -2,7 +2,8 @@ module utilities
   use,intrinsic :: iso_fortran_env, only: wp => real64
   implicit none
 
-  public :: nth_prime
+  public :: nth_prime,first_primes
+  public :: sorted_order,isort
   public :: qsorti
   interface qsorti
     module procedure qsorti_i
@@ -147,6 +148,85 @@ contains
     end do
     prime = num
   end function nth_prime
+
+  function first_primes(n) result(primes)
+    !*********************************************
+    !* The first n prime numbers, from a sieve of
+    !* Eratosthenes (p_n < n*(ln n + ln ln n)).
+    !*********************************************
+    implicit none
+    integer,intent(in) :: n
+    integer,allocatable :: primes(:)
+    logical,allocatable :: comp(:)
+    integer :: limit,i,j,k
+    allocate (primes(max(n,0)))
+    if (n < 1) return
+    if (n < 6) then
+      limit = 13
+    else
+      limit = int(n*(log(real(n,wp))+log(log(real(n,wp)))))+1
+    end if
+    allocate (comp(limit),source=.false.)
+    k = 0
+    do i = 2,limit
+      if (comp(i)) cycle
+      k = k+1
+      primes(k) = i
+      if (k == n) exit
+      if (i > limit/i) cycle
+      do j = i*i,limit,i
+        comp(j) = .true.
+      end do
+    end do
+  end function first_primes
+
+  subroutine sorted_order(n,v,idx)
+    !**************************************************
+    !* idx(1:n) such that v(idx(1:n)) ascends.
+    !* Insertion sort for short arrays, else quicksort.
+    !**************************************************
+    implicit none
+    integer,intent(in) :: n
+    real(wp),intent(in) :: v(:)
+    integer,intent(inout) :: idx(:)
+    integer :: i,j,t
+    do i = 1,n
+      idx(i) = i
+    end do
+    if (n > 16) then
+      call qsorti_wp(v(1:n),idx(1:n),1,n)
+      return
+    end if
+    do i = 2,n
+      t = idx(i)
+      j = i-1
+      do while (j >= 1)
+        if (v(idx(j)) <= v(t)) exit
+        idx(j+1) = idx(j)
+        j = j-1
+      end do
+      idx(j+1) = t
+    end do
+  end subroutine sorted_order
+
+  pure subroutine isort(v)
+    !*************************************
+    !* Insertion sort (short arrays only)
+    !*************************************
+    implicit none
+    integer,intent(inout) :: v(:)
+    integer :: i,j,t
+    do i = 2,size(v)
+      t = v(i)
+      j = i-1
+      do while (j >= 1)
+        if (v(j) <= t) exit
+        v(j+1) = v(j)
+        j = j-1
+      end do
+      v(j+1) = t
+    end do
+  end subroutine isort
 
   recursive subroutine qsorti_i(v,ix,l,r)
     !*********************

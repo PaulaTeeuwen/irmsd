@@ -6,6 +6,7 @@ module irmsd_exposed
   use axis_module
   use irmsd_module
   use canonical_mod
+  use irmsd_refine
   implicit none
 contains
 
@@ -52,6 +53,8 @@ contains
     integer :: i
     type(rmsd_cache) :: rcache
     logical :: mirror
+    integer :: io
+    real(wp) :: rmsdref
 
     logical,parameter :: debug = .false.
 
@@ -89,7 +92,13 @@ contains
 
     if (debug) write (stdout,*) 'allow inversion?:            ',mirror
 
-    call min_rmsd(ref,mol,rcache=rcache,rmsdout=rmsdval,align=.true.)
+    call min_rmsd(ref,mol,rcache=rcache,rmsdout=rmsdval,align=.true.,io=io)
+
+    !> bond-preserving assignment: centre walk vs. min_rmsd, terminal atoms refined
+    if (io == 0) then
+      call refine_assignment(ref,mol,rcache%rank(:,1),rcache%stereocheck,rmsdref,io)
+      if (io == 0) rmsdval = rmsdref
+    end if
 
     if (debug) then
       do i = 1,mol%nat
@@ -114,4 +123,77 @@ contains
     call mol%mol_to_C(types_out2_c,coords_out2_c,.true.)
 
   end subroutine get_irmsd_fortran
+
+!========================================================================================!
+
+  subroutine bond_mismatch(ref,mol,nmis,atmis)
+    !*******************************************************************
+    !* Check whether the correspondence ref atom i <-> mol atom i
+    !* preserves the bonding pattern. Bonds are detected separately for
+    !* each structure from its own geometry, with the same covalent CN
+    !* criterion the canonical ranks are built from.
+    !*
+    !* ref, mol : structures with equal atom count, in matched order
+    !*            (e.g. the output of min_rmsd)
+    !* nmis     : (out) number of atom pairs bonded in exactly one of
+    !*            the two structures; 0 means the mapping is bond-preserving
+    !* atmis    : (out) per-atom number of such pairs
+    !*******************************************************************
+    implicit none
+    type(coord),intent(in) :: ref,mol
+    integer,intent(out) :: nmis
+    integer,intent(out) :: atmis(:)
+    integer,allocatable :: aref(:,:),amol(:,:)
+    integer :: i,j
+
+    call ref%cn_to_adjacency(aref)
+    call mol%cn_to_adjacency(amol)
+
+    nmis = 0
+    atmis(:) = 0
+    do i = 1,ref%nat
+      do j = 1,i-1
+        if (aref(j,i) /= amol(j,i)) then
+          nmis = nmis+1
+          atmis(i) = atmis(i)+1
+          atmis(j) = atmis(j)+1
+        end if
+      end do
+    end do
+  end subroutine bond_mismatch
+
+  subroutine get_bond_mismatch_fortran(natoms,types1_ptr,coords1_ptr, &
+                                       types2_ptr,coords2_ptr,nmis_c,atmis_ptr) &
+    bind(C,name="get_bond_mismatch_fortran")
+    !*******************************************************************
+    !* C interface to bond_mismatch. Both structures must be given in
+    !* matched atom order, e.g. the aligned output of get_irmsd_fortran.
+    !*
+    !* natoms        : number of atoms of both structures
+    !* types*/coords*: atomic numbers and coordinates in Angstrom
+    !* nmis_c        : (out) number of mismatched atom pairs
+    !* atmis_ptr     : (out) per-atom number of mismatched pairs
+    !*******************************************************************
+    use,intrinsic :: iso_c_binding
+    implicit none
+    integer(c_int),value :: natoms
+    type(c_ptr),value :: types1_ptr,coords1_ptr
+    type(c_ptr),value :: types2_ptr,coords2_ptr
+    integer(c_int),intent(out) :: nmis_c
+    type(c_ptr),value :: atmis_ptr
+    integer(c_int),pointer :: atmis_c(:)
+    type(coord) :: ref,mol
+    integer,allocatable :: atmis(:)
+    integer :: nmis
+
+    call ref%C_to_mol(natoms,types1_ptr,coords1_ptr,.true.)
+    call mol%C_to_mol(natoms,types2_ptr,coords2_ptr,.true.)
+    allocate (atmis(natoms))
+
+    call bond_mismatch(ref,mol,nmis,atmis)
+
+    nmis_c = int(nmis,c_int)
+    call c_f_pointer(atmis_ptr,atmis_c, [natoms])
+    atmis_c(:) = int(atmis(:),c_int)
+  end subroutine get_bond_mismatch_fortran
 end module irmsd_exposed

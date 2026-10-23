@@ -8,6 +8,7 @@ module strucrd
   use,intrinsic :: iso_fortran_env,only:wp => real64
   use,intrinsic :: iso_c_binding
   use crest_cn_module,only:calculate_CN
+  use adjacency,only:wbo2adjacency
   use miscdata,only:PSE
   implicit none
 
@@ -66,6 +67,7 @@ module strucrd
     procedure :: get_CN => coord_get_CN         !> calculate coordination number
     procedure :: get_z => coord_get_z           !> calculate nuclear charge
     procedure :: cn_to_bond => coord_cn_to_bond !> generate neighbour matrix from CN
+    procedure :: cn_to_adjacency => coord_cn_to_adjacency !> integer adjacency matrix from CN
     procedure :: swap => atswp                  !> swap two atoms coordinates and their at() entries
     procedure :: C_to_mol
     procedure :: mol_to_C
@@ -303,6 +305,23 @@ contains   !> MODULE PROCEDURES START HERE
     call calculate_CN(self%nat,self%at,self%xyz,cn, &
     & cntype=cn_type,cnthr=cn_thr,bond=bond)
   end subroutine coord_cn_to_bond
+
+  subroutine coord_cn_to_adjacency(self,A)
+    !*************************************************************
+    !* Covalent connectivity as an integer adjacency matrix, with
+    !* the same criterion the canonical ranks are built from
+    !* (covalent CN bond matrix, threshold 0.02).
+    !*************************************************************
+    implicit none
+    class(coord),intent(in) :: self
+    integer,allocatable,intent(out) :: A(:,:)
+    real(wp),allocatable :: cn(:),bond(:,:)
+    if (self%nat <= 0) return
+    if (.not.allocated(self%xyz).or..not.allocated(self%at)) return
+    allocate (cn(self%nat),source=0.0_wp)
+    call calculate_CN(self%nat,self%at,self%xyz,cn,cntype='cov',bond=bond)
+    call wbo2adjacency(self%nat,bond,A,0.02_wp)
+  end subroutine coord_cn_to_adjacency
 
 !=============================================================!
 

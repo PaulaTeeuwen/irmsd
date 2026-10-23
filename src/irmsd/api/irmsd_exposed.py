@@ -127,3 +127,58 @@ def get_irmsd(
     P4 -= center4
 
     return rmsdval, Z3, P3, Z4, P4
+
+
+def check_bond_preservation(
+    atom_numbers1: np.ndarray,
+    positions1: np.ndarray,
+    atom_numbers2: np.ndarray,
+    positions2: np.ndarray,
+) -> Tuple[int, np.ndarray]:
+    """
+    Check whether the atom correspondence between two structures preserves
+    the bonding pattern.
+
+    Atom ``i`` of structure 1 is taken to correspond to atom ``i`` of
+    structure 2, as in the aligned output of :func:`get_irmsd`. Bonds are
+    detected separately for each structure from its geometry, with the same
+    covalent coordination-number criterion used for the canonical ranks.
+
+    Parameters
+    ----------
+    atom_numbers1, atom_numbers2 : (N,) int-like
+        Atomic numbers of both structures, in matched order.
+    positions1, positions2 : (N, 3) float-like
+        Cartesian coordinates in Å, in matched order.
+
+    Returns
+    -------
+    nmismatch : int
+        Number of atom pairs bonded in exactly one of the two structures.
+        Zero means the correspondence is bond-preserving.
+    per_atom : (N,) int32 ndarray
+        Number of such pairs each atom takes part in.
+
+    Raises
+    ------
+    ValueError
+        If the structures differ in size or positions do not have shape (N, 3).
+    """
+    Z1 = np.ascontiguousarray(atom_numbers1, dtype=np.int32)
+    Z2 = np.ascontiguousarray(atom_numbers2, dtype=np.int32)
+    P1 = np.ascontiguousarray(positions1, dtype=np.float64)
+    P2 = np.ascontiguousarray(positions2, dtype=np.float64)
+
+    if P1.ndim != 2 or P1.shape[1] != 3:
+        raise ValueError("positions1 must have shape (N, 3)")
+    if P2.shape != P1.shape:
+        raise ValueError("positions2 must have the same shape as positions1")
+    n = int(P1.shape[0])
+    if Z1.shape != (n,) or Z2.shape != (n,):
+        raise ValueError("atom_numbers must have shape (N,)")
+
+    per_atom = np.zeros(n, dtype=np.int32)
+    nmismatch = _F.get_bond_mismatch_fortran_raw(
+        n, Z1, P1.reshape(-1).copy(order="C"), Z2, P2.reshape(-1).copy(order="C"), per_atom
+    )
+    return nmismatch, per_atom
