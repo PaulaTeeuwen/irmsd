@@ -11,6 +11,11 @@ add_library(irmsd_fortran SHARED
     ${srcs}
 )
 
+find_package(OpenMP COMPONENTS Fortran)
+if (OpenMP_Fortran_FOUND)
+    target_link_libraries(irmsd_fortran PRIVATE OpenMP::OpenMP_Fortran)
+endif()
+
 set_target_properties(irmsd_fortran PROPERTIES
     OUTPUT_NAME "irmsd_fortran"
     WINDOWS_EXPORT_ALL_SYMBOLS ON

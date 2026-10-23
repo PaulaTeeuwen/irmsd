@@ -514,11 +514,12 @@ contains  !> MODULE PROCEDURES START HERE
     real(wp) :: calc_rmsd
     real(wp) :: tmprmsd_sym(32)
     real(wp) :: rotmat(3,3),rotconst(3),shift(3)
-    logical :: topocheck_l = .true.
+    logical :: topocheck_l
     logical,parameter :: debug = .false.
 
-!>--- defaults
+!>--- defaults (not in the declaration: that would imply SAVE)
     ioloc = 0
+    topocheck_l = .true.
 
 !>--- Initialization
     if (present(rcache)) then
@@ -579,14 +580,14 @@ contains  !> MODULE PROCEDURES START HERE
 
 !>--- Count symmetry equivalent groups and assign all unique atoms immediately
 !     Note, the rank can be zero if we only are looking at heavy atoms
-    if (all(cptr%ngroup(:) .eq. 0)) then
-      do ii = 1,ref%nat
-        rnk = cptr%rank(ii,1)
-        if (rnk > 0) then
-          cptr%ngroup(rnk) = cptr%ngroup(rnk)+1
-        end if
-      end do
-    end if
+!     Recount every call: a reused cache may hold another pair's counts
+    cptr%ngroup(:) = 0
+    do ii = 1,ref%nat
+      rnk = cptr%rank(ii,1)
+      if (rnk > 0) then
+        cptr%ngroup(rnk) = cptr%ngroup(rnk)+1
+      end if
+    end do
     !> assignment reset
     cptr%assigned(:) = .false.
     cptr%rassigned(:) = .false.
@@ -832,10 +833,10 @@ contains  !> MODULE PROCEDURES START HERE
     !> LOCAL
     type(rmsd_cache),pointer :: cptr
     type(rmsd_cache),allocatable,target :: local_rcache
-    logical :: align_l = .true.
-    logical :: topocheck_l = .true.
-    logical :: allcanon_l = .false.
-    integer :: io_l = 0
+    logical :: align_l
+    logical :: topocheck_l
+    logical :: allcanon_l
+    integer :: io_l
     real(wp) ::tmpd(3),tmpdist
     integer :: i,ich
     logical :: mirror
@@ -845,6 +846,10 @@ contains  !> MODULE PROCEDURES START HERE
     call axis(ref%nat,ref%at,ref%xyz)
 
     !> optional args
+    align_l = .true.
+    topocheck_l = .true.
+    allcanon_l = .false.
+    io_l = 0
     if (present(align)) align_l = align
     if (present(topocheck)) topocheck_l = topocheck
     if (present(allcanon)) allcanon_l = allcanon

@@ -9,6 +9,7 @@ module sorter_exposed
   use irmsd_refine,only:refine_assignment
   use utilities,only:qsorti
   use term_ui
+  !$ use omp_lib
   implicit none
   private
 
@@ -188,7 +189,7 @@ contains  !> MODULE PROCEDURES START HERE
     type(coord),pointer :: ref,mol
     real(wp) :: rmsdval,RTHR,ediff,eii
     integer,allocatable :: prune_table(:)
-    integer,allocatable :: topo_group(:)
+    integer,allocatable :: topo_class(:)
     logical :: stereocheck,individual_IDs
     type(progress_state) :: ps
     character(len=:),allocatable :: tmpstr
@@ -208,8 +209,8 @@ contains  !> MODULE PROCEDURES START HERE
     end if
 
 !>--- set up parallelization
-!     ...
-    T = 1 !> doing it serial for now
+    T = 1
+    !$ T = omp_get_max_threads()
 
 !>--- set up parameters (NOTE, we are working with BOHR internally)
     RTHR = RTHRESH*aatoau
@@ -227,7 +228,7 @@ contains  !> MODULE PROCEDURES START HERE
       if (present(ETHR)) then
         write (stdout,'(2x,a,es10.2,a)') 'ETHR (energy threshold)  :',ETHR,' Ha'
       end if
-      !write (stdout,'(2x,a,i9)') 'OpenMP threads           :',T
+      write (stdout,'(2x,a,i10)') 'OpenMP threads           :',T
       write (stdout,'(2x,a,l10)') 'Individual atom IDs?     :',individual_IDs
       write (stdout,'(2x,a)',advance='no') 'False enantiomer check?  :'
       select case (iinversion)
@@ -372,9 +373,12 @@ contains  !> MODULE PROCEDURES START HERE
       end do
     end if
 
-    !> topo_group dynamically keeps track of different topology groups
-    !> among the structures. All structures start out as the same topology
-    allocate (topo_group(nall),source=1)
+    !> topology classes up front; different classes never match. Provided ids
+    !> may be replaced per pair (fallbackranks), so then min_rmsd decides.
+    allocate (topo_class(nall),source=1)
+    if (.not.any(has_id)) then
+      call assign_topo_classes(nall,nat,structures,ranks_all,topo_class)
+    end if
 !> --------------------------------------------
 !> pre-processing end
 !> --------------------------------------------
@@ -399,17 +403,14 @@ contains  !> MODULE PROCEDURES START HERE
       groups(ii) = gcount
 
 !>--- Then, cross-check all other unassigned conformers
-      cc = 1  !> again, serial implementation for now
-      ! !$omp parallel &
-      ! !$omp shared(nall, nat, groups, individual_IDs, sorters, rcaches) &
-      ! !$omp shared(workmols, structures, ii, prune_table,topo_group) &
-      ! !$omp private(jj,rmsdval,cc,io)
-      ! !$omp do schedule(dynamic)
+      !$omp parallel do schedule(dynamic) default(shared) &
+      !$omp private(jj,cc,rmsdval,rmsdref,io,ioref)
       do jj = ii+1,nall
-        !cc = omp_get_thread_num()+1
+        cc = 1
+        !$ cc = omp_get_thread_num()+1
         if (groups(jj) .ne. 0) cycle
         if (ii < prune_table(jj)) cycle
-        if (topo_group(ii) .ne. topo_group(jj)) cycle
+        if (topo_class(ii) .ne. topo_class(jj)) cycle
         rcaches(cc)%rank(1:nat,1) = ranks_all(1:nat,ii)
         rcaches(cc)%rank(1:nat,2) = ranks_all(1:nat,jj)
         !> if a provided id is involved, make sure the two rank sets are
@@ -424,21 +425,17 @@ contains  !> MODULE PROCEDURES START HERE
         workmols(cc)%xyz(:,:) = structures(jj)%xyz(:,:)
         call min_rmsd(structures(ii),workmols(cc), &
         &        rcache=rcaches(cc),rmsdout=rmsdval,io=io)
-        if (io .ne. 0) then
-          topo_group(jj) = topo_group(jj)+1
-          cycle
-        end if
+        if (io .ne. 0) cycle
         call refine_assignment(structures(ii),workmols(cc), &
         &        rcaches(cc)%rank(1:nat,1),rcaches(cc)%stereocheck,rmsdref,ioref)
         if (ioref == 0) rmsdval = rmsdref
         if (rmsdval < RTHR) groups(jj) = gcount
 
       end do
+      !$omp end parallel do
       if (prlvl > 1) then
         call progress_update(ps,ii,nall)
       end if
-      ! !$omp end do
-      ! !$omp end parallel
     end do
     if (prlvl > 0) then
       if (prlvl > 1) then
@@ -449,9 +446,46 @@ contains  !> MODULE PROCEDURES START HERE
       end if
     end if
 
-    if (allocated(topo_group)) deallocate (topo_group)
+    if (allocated(topo_class)) deallocate (topo_class)
     if (allocated(prune_table)) deallocate (prune_table)
   end subroutine cregen_irmsd_sort
+
+  subroutine assign_topo_classes(nall,nat,structures,ranks,tclass)
+!*****************************************************************
+!* Topology classes: same class iff the sorted (rank, atom type) lists match
+!*****************************************************************
+    implicit none
+    integer,intent(in) :: nall,nat
+    type(coord),intent(in) :: structures(nall)
+    integer,intent(in) :: ranks(nat,nall)
+    integer,intent(out) :: tclass(nall)
+    integer,allocatable :: sig(:,:),key(:),cur(:),ix(:)
+    integer :: ii,k,nclass
+
+    allocate (sig(nat,nall),key(nat),cur(nat),ix(nat))
+    nclass = 0
+    do ii = 1,nall
+      do k = 1,nat
+        key(k) = ranks(k,ii)*256+structures(ii)%at(k)
+        ix(k) = k
+      end do
+      call qsorti(key,ix,1,nat)
+      cur(:) = key(ix)
+      tclass(ii) = 0
+      do k = 1,nclass
+        if (all(cur .eq. sig(:,k))) then
+          tclass(ii) = k
+          exit
+        end if
+      end do
+      if (tclass(ii) == 0) then
+        nclass = nclass+1
+        sig(:,nclass) = cur
+        tclass(ii) = nclass
+      end if
+    end do
+    deallocate (sig,key,cur,ix)
+  end subroutine assign_topo_classes
 
   subroutine delta_irmsd_list(nall,structures,iinversion,delta,allcanon,printlvl)
 !*******************************************************************
